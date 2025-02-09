@@ -1,250 +1,477 @@
+import collections
 import hashlib
+from typing import Iterator, Union
 
-from androguard.core.analysis.analysis import *
-from androguard.core.bytecodes.dvm import *
-from androguard.decompiler.decompiler import *
+import dataset
+from loguru import logger
 
-import pickle
+from androguard.core import androconf, apk, dex
+from androguard.core.analysis.analysis import Analysis, StringAnalysis
+from androguard.decompiler.decompiler import DecompilerDAD
 
 
-def Save(session, filename):
+class Session:
     """
-    save your session!
+    A Session is able to store in a database, basic information about APK, DEX or ODEX files.
+    Additionally, it offers the possibility to store actions done when using the 'pentest' module.
 
-    :param session: A Session object to save
-    :param filename: output filename to save the session
-    :type filename: string
+    NOTE: an attempt to move from pickling to dataset was started here:
+    <https://github.com/androguard/androguard/commit/4dd0dc8c4b55605af863925faf16e8eb35f13e45>
+    but is NOT finished!
 
-    :Example:
-        s = session.Session()
-        session.Save(s, "msession.p")
+    > Should we go back to pickling or proceed further with the dataset ?
     """
-    with open(filename, "wb") as fd:
-        pickle.dump(session, fd)
 
+    def __init__(
+        self,
+        export_ipython: bool = False,
+        db_url: str = 'sqlite:///androguard.db',
+    ) -> None:
+        """
+        Create a new Session object
 
-def Load(filename):
-    """
-      load your session!
-
-      :param filename: the filename where the session has been saved
-      :type filename: string
-
-      :rtype: the elements of your session :)
-
-      :Example:
-          s = session.Load("mysession.p")
-    """
-    with open(filename, "rb") as fd:
-        return pickle.load(fd)
-
-
-class Session(object):
-    def __init__(self, export_ipython=False):
-        self._setupObjects()
+        :param export_ipython: set to True in order to create attributes for the
+        use in iPython
+        """
+        self._setup_objects()
         self.export_ipython = export_ipython
 
-    def _setupObjects(self):
-        self.analyzed_files = collections.OrderedDict()
-        self.analyzed_digest = {}
-        self.analyzed_apk = {}
-        self.analyzed_dex = {}
+        self.db = dataset.connect(db_url)
+        logger.info("Opening database {}".format(self.db))
+        self.table_information = self.db["information"]
+        self.table_session = self.db["session"]
+        self.table_pentest = self.db["pentest"]
+        self.table_system = self.db["system"]
 
-    def reset(self):
-        self._setupObjects()
+        self.session_id = len(self.table_session)
 
-    def isOpen(self):
+        self.table_session.insert(dict(id=self.session_id))
+        logger.info("Creating new session [{}]".format(self.session_id))
+
+    def save(self, filename: Union[str, None] = None) -> None:
+        """
+        Save the current session
+        """
+        logger.info("Saving the database")
+        self.db.commit()
+
+    def _setup_objects(self):
+        self.analyzed_files = collections.defaultdict(list)
+        self.analyzed_digest = dict()
+        self.analyzed_apk = dict()
+        self.added_files = []
+
+        # Stores Analysis Objects
+        # needs to be ordered to return the outermost element when searching for
+        # classes
+        self.analyzed_vms = collections.OrderedDict()
+
+        # Dict of digest and DEX/DalvikOdexFormat
+        # Actually not needed, as we have Analysis objects which store the DEX
+        # files as well, but we do not remove it here for legacy reasons
+        self.analyzed_dex = dict()
+
+    def reset(self) -> None:
+        """
+        Reset the current session, delete all added files.
+        """
+        self._setup_objects()
+
+    def isOpen(self) -> bool:
         """
         Test if any file was analyzed in this session
-        
+
         :return: `True` if any file was analyzed, `False` otherwise
         """
-        return self.analyzed_digest != {}
+        return len(self.analyzed_digest) > 0
 
-    def addAPK(self, filename, data):
+    def show(self) -> None:
+        """
+        Print information to stdout about the current session.
+        Gets all APKs, all DEX files and all Analysis objects.
+        """
+        print("APKs in Session: {}".format(len(self.analyzed_apk)))
+        for d, a in self.analyzed_apk.items():
+            print("\t{}: {}".format(d, a))
+
+        print("DEXs in Session: {}".format(len(self.analyzed_dex)))
+        for d, dex in self.analyzed_dex.items():
+            print("\t{}: {}".format(d, dex))
+
+        print("Analysis in Session: {}".format(len(self.analyzed_vms)))
+        for d, a in self.analyzed_vms.items():
+            print("\t{}: {}".format(d, a))
+
+    def insert_event(self, call, callee, params, ret):
+        self.table_pentest.insert(
+            dict(
+                session_id=str(self.session_id),
+                call=call,
+                callee=callee,
+                params=params,
+                ret=ret,
+            )
+        )
+
+    def insert_system_event(self, call, callee, information, params):
+        self.table_system.insert(
+            dict(
+                session_id=str(self.session_id),
+                call=call,
+                callee=callee,
+                information=information,
+                params=params,
+            )
+        )
+
+    def addAPK(self, filename: str, data: bytes) -> tuple[str, apk.APK]:
         """
         Add an APK file to the Session and run analysis on it.
-        
+
         :param filename: (file)name of APK file
         :param data: binary data of the APK file
         :return: a tuple of SHA256 Checksum and APK Object
         """
         digest = hashlib.sha256(data).hexdigest()
-        androconf.debug("add APK:%s" % digest)
-        apk = APK(data, True)
-        self.analyzed_apk[digest] = [apk]
+
+        logger.info("add APK {}:{}".format(filename, digest))
+        self.table_information.insert(
+            dict(
+                session_id=str(self.session_id),
+                filename=filename,
+                digest=digest,
+                type="APK",
+            )
+        )
+
+        newapk = apk.APK(data, True)
+        self.analyzed_apk[digest] = [newapk]
         self.analyzed_files[filename].append(digest)
         self.analyzed_digest[digest] = filename
-        androconf.debug("added APK:%s" % digest)
-        return digest, apk
+        self.added_files.append(filename)
 
-    def addDEX(self, filename, data, dx=None):
-        """
-        Add a DEX file to the Session and run analysis.
-        
-        :param filename: the (file)name of the DEX file
-        :param data: binary data of the dex file
-        :param dx: an existing Analysis Object (optional)
-        :return: A tuple of SHA256 Hash, DalvikVMFormat Object and Analysis object
-        """
-        digest = hashlib.sha256(data).hexdigest()
-        androconf.debug("add DEX:%s" % digest)
+        dx = Analysis()
+        self.analyzed_vms[digest] = dx
 
-        androconf.debug("Parsing format ...")
-        d = DalvikVMFormat(data)
+        for dex in newapk.get_all_dex():
+            # we throw away the output... FIXME?
+            self.addDEX(filename, dex, dx, postpone_xref=True)
 
-        androconf.debug("Running analysis ...")
-        dx = self.runAnalysis(d, dx)
-
-        androconf.debug("added DEX:%s" % digest)
-
-        self.analyzed_dex[digest] = (d, dx)
-        if filename not in self.analyzed_files:
-            self.analyzed_files[filename] = []
-
-        self.analyzed_files[filename].append(digest)
-        self.analyzed_digest[digest] = filename
-
-        if self.export_ipython:
-            androconf.debug("Exporting in ipython")
-            d.create_python_export()
-
-        return digest, d, dx
-
-    def addDEY(self, filename, data, dx=None):
-        digest = hashlib.sha256(data).hexdigest()
-        androconf.debug("add DEY:%s" % digest)
-
-        d = DalvikOdexVMFormat(data)
-        dx = self.runAnalysis(d, dx)
-
-        androconf.debug("added DEY:%s" % digest)
-
-        self.analyzed_dex[digest] = (d, dx)
-        if filename not in self.analyzed_files:
-            self.analyzed_files[filename] = []
-
-        self.analyzed_files[filename].append(digest)
-        self.analyzed_digest[digest] = filename
-
-        if self.export_ipython:
-            d.create_python_export()
-
-        return digest, d, dx
-
-    def runAnalysis(self, d, dx=None):
-        if dx is None:
-            dx = Analysis(d)
-        else:
-            dx.add(d)
-
+        # Postponed
         dx.create_xref()
 
-        d.set_decompiler(DecompilerDAD(d, dx))
-        d.set_vmanalysis(dx)
+        logger.info("added APK {}:{}".format(filename, digest))
+        return digest, newapk
 
-        return dx
+    def addDEX(
+        self,
+        filename: str,
+        data: bytes,
+        dx: Union[Analysis, None] = None,
+        postpone_xref: bool = False,
+    ) -> tuple[str, dex.DEX, Analysis]:
+        """
+        Add a DEX file to the Session and run analysis.
 
-    def add(self, filename, raw_data, dx=None):
+        :param filename: the (file)name of the DEX file
+        :param data: binary data of the dex file
+        :param dx: an existing `Analysis` Object (optional)
+        :param postpone_xref: True if no xref shall be created, and will be called manually
+        :return: A tuple of SHA256 Hash, DEX Object and `Analysis` object
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        logger.info("add DEX:{}".format(digest))
+
+        self.table_information.insert(
+            dict(
+                session_id=str(self.session_id),
+                filename=filename,
+                digest=digest,
+                type="DEX",
+            )
+        )
+
+        logger.debug("Parsing format ...")
+        d = dex.DEX(data)
+        logger.info("added DEX:{}".format(digest))
+
+        self.analyzed_files[filename].append(digest)
+        self.analyzed_digest[digest] = filename
+
+        self.analyzed_dex[digest] = d
+
+        if dx is None:
+            dx = Analysis()
+
+        dx.add(d)
+        if not postpone_xref:
+            dx.create_xref()
+
+        logger.debug("Associated decompiler to the DEX objects")
+        for d in dx.vms:
+            # TODO: allow different decompiler here!
+            d.set_decompiler(DecompilerDAD(d, dx))
+            d.set_analysis(dx)
+        self.analyzed_vms[digest] = dx
+
+        if self.export_ipython:
+            logger.debug("Exporting in ipython")
+            d.create_python_export()
+
+        return digest, d, dx
+
+    def addODEX(
+        self, filename: str, data: bytes, dx: Union[Analysis, None] = None
+    ) -> tuple[str, dex.ODEX, Analysis]:
+        """
+        Add an ODEX file to the session and run the analysis
+
+        :param filename: the ODEX filename
+        :param data: the ODEX bytes
+        :param dx: the `Analysis` object to add the ODEX to
+        :returns: a tuple containing the SHA256 digest, the new `dex.ODEX` object, and the `Analysis` it is contained within.
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        logger.info("add ODEX:%s" % digest)
+
+        self.table_information.insert(
+            dict(
+                session_id=str(self.session_id),
+                filename=filename,
+                digest=digest,
+                type="ODEX",
+            )
+        )
+
+        d = dex.ODEX(data)
+        logger.debug("added ODEX:%s" % digest)
+
+        self.analyzed_files[filename].append(digest)
+        self.analyzed_digest[digest] = filename
+
+        self.analyzed_dex[digest] = d
+
+        if self.export_ipython:
+            d.create_python_export()
+
+        if dx is None:
+            dx = Analysis()
+
+        dx.add(d)
+        dx.create_xref()
+
+        for d in dx.vms:
+            # TODO: allow different decompiler here!
+            d.set_decompiler(DecompilerDAD(d, dx))
+            d.set_vmanalysis(dx)
+
+        self.analyzed_vms[digest] = dx
+
+        return digest, d, dx
+
+    def add(
+        self,
+        filename: str,
+        raw_data: Union[bytes, None] = None,
+        dx: Union[Analysis, None] = None,
+    ) -> Union[str, None]:
+        """
+        Generic method to add a file to the session.
+
+        This is the main method to use when adding files to a Session!
+
+        If an APK file is supplied, all DEX files are analyzed too.
+        For DEX and ODEX files, only this file is analyzed (what else should be
+        analyzed).
+
+        Returns the SHA256 of the analyzed file.
+
+        :param filename: filename to load
+        :param raw_data: bytes of the file, or None to load the file from filename
+        :param dx: An already exiting `androguard.core.analysis.analysis.Analysis` object
+        :return: the sha256 of the file or None on failure
+        """
+        if not raw_data:
+            logger.debug("Loading file from '{}'".format(filename))
+            with open(filename, "rb") as fp:
+                raw_data = fp.read()
+
         ret = androconf.is_android_raw(raw_data)
-        if ret:
-            self.analyzed_files[filename] = []
-            digest = hashlib.sha256(raw_data).hexdigest()
-            if ret == "APK":
-                apk_digest, apk = self.addAPK(filename, raw_data)
-                dex_files = list(apk.get_all_dex())
+        logger.debug("Found filetype: '{}'".format(ret))
+        if not ret:
+            return None
 
-                if dex_files:
-                    dex_digest, _, dx = self.addDEX(filename, dex_files[0], dx)
-                    self.analyzed_apk[digest].append(dex_digest)
-                    for i in range(1, len(dex_files)):
-                        dex_digest, _, _ = self.addDEX(filename, dex_files[i],
-                                                       dx)
-                        self.analyzed_apk[digest].append(dex_digest)
-            elif ret == "DEX":
-                self.addDEX(filename, raw_data, dx)
-            elif ret == "DEY":
-                self.addDEY(filename, raw_data, dx)
-            else:
-                return False
-            return True
-        return False
+        if ret == "APK":
+            digest, _ = self.addAPK(filename, raw_data)
+        elif ret == "DEX":
+            digest, _, _ = self.addDEX(filename, raw_data, dx)
+        elif ret == "DEY":
+            digest, _, _ = self.addODEX(filename, raw_data, dx)
+        else:
+            return None
 
-    def get_classes(self):
-        idx = 0
-        for filename in self.analyzed_files:
-            for digest in self.analyzed_files[filename]:
-                if digest in self.analyzed_dex:
-                    d, _ = self.analyzed_dex[digest]
-                    yield idx, filename, digest, d.get_classes()
-            idx += 1
+        return digest
 
-    def get_analysis(self, current_class):
-        for digest in self.analyzed_dex:
-            d, dx = self.analyzed_dex[digest]
+    def get_classes(
+        self,
+    ) -> Iterator[tuple[int, str, str, list[dex.ClassDefItem]]]:
+        """
+        Returns all Java Classes from the DEX objects as an array of DEX files.
+
+        :returns: an iterator where each element is a tuple containing the index of the `Analysis` object, the filename containing the class (ODEX, DEX), the SHA256 digest of the `Analysis` object, and a list of `CalssDefItem`
+        """
+        for idx, digest in enumerate(self.analyzed_vms):
+            dx = self.analyzed_vms[digest]
+            for vm in dx.vms:
+                filename = self.analyzed_digest[digest]
+                yield idx, filename, digest, vm.get_classes()
+
+    def get_analysis(self, current_class: dex.ClassDefItem) -> Analysis:
+        """
+        Returns the [Analysis][androguard.core.analysis.analysis.Analysis] object
+        which contains the `current_class`.
+
+        :param current_class: The class to search for
+        :returns: the `androguard.core.analysis.analysis.Analysis` object
+        """
+        for digest in self.analyzed_vms:
+            dx = self.analyzed_vms[digest]
             if dx.is_class_present(current_class.get_name()):
                 return dx
         return None
 
-    def get_format(self, current_class):
-        for digest in self.analyzed_dex:
-            d, dx = self.analyzed_dex[digest]
-            if dx.is_class_present(current_class.get_name()):
-                return d
-        return None
+    def get_format(self, current_class: dex.ClassDefItem) -> dex.DEX:
+        """
+        Returns the [DEX][androguard.core.dex.DEX] of a
+        given [ClassDefItem][androguard.core.dex.ClassDefItem].
 
-    def get_filename_by_class(self, current_class):
-        for digest in self.analyzed_dex:
-            d, dx = self.analyzed_dex[digest]
+        :param current_class: A ClassDefItem
+        """
+        return current_class.CM.vm
+
+    def get_filename_by_class(
+        self, current_class: dex.ClassDefItem
+    ) -> Union[str, None]:
+        """
+        Returns the filename of the DEX file where the class is in.
+
+        Returns the first filename this class was present.
+        For example, if you analyzed an APK, this should return the filename of
+        the APK and not of the DEX file.
+
+        :param current_class: `ClassDefItem`
+        :returns: `None` if class was not found or the filename
+        """
+        for digest, dx in self.analyzed_vms.items():
             if dx.is_class_present(current_class.get_name()):
                 return self.analyzed_digest[digest]
         return None
 
-    def get_digest_by_class(self, current_class):
-        for digest in self.analyzed_dex:
-            d, dx = self.analyzed_dex[digest]
+    def get_digest_by_class(
+        self, current_class: dex.ClassDefItem
+    ) -> Union[str, None]:
+        """
+        Return the SHA256 hash of the object containing the [ClassDefItem][androguard.core.dex.ClassDefItem]
+
+        Returns the first digest this class was present.
+        For example, if you analyzed an APK, this should return the digest of
+        the APK and not of the DEX file.
+        """
+        for digest, dx in self.analyzed_vms.items():
             if dx.is_class_present(current_class.get_name()):
                 return digest
         return None
 
-    def get_strings(self):
-        for digest in self.analyzed_dex:
-            d, dx = self.analyzed_dex[digest]
-            yield digest, self.analyzed_digest[digest], dx.get_strings_analysis(
-            )
+    def get_strings(
+        self,
+    ) -> Iterator[tuple[str, str, dict[str, StringAnalysis]]]:
+        """
+        Yields all [StringAnalysis][androguard.core.analysis.analysis.StringAnalysis] for all unique [Analysis][androguard.core.analysis.analysis.Analysis] objects
 
-    def get_nb_strings(self):
+        :returns: an iterator of `StringAnalysis` objects
+        """
+        seen = []
+        for digest, dx in self.analyzed_vms.items():
+            if dx in seen:
+                continue
+            seen.append(dx)
+            yield digest, self.analyzed_digest[
+                digest
+            ], dx.get_strings_analysis()
+
+    def get_nb_strings(self) -> int:
+        """
+        Return the total number of strings in all [Analysis][androguard.core.analysis.analysis.Analysis] objects
+
+        :returns: the number of strings
+        """
         nb = 0
-        for digest in self.analyzed_dex:
-            d, dx = self.analyzed_dex[digest]
+        seen = []
+        for digest, dx in self.analyzed_vms.items():
+            if dx in seen:
+                continue
+            seen.append(dx)
             nb += len(dx.get_strings_analysis())
         return nb
 
-    def get_all_apks(self):
-        for digest in self.analyzed_apk:
-            yield digest, self.analyzed_apk[digest]
+    def get_all_apks(self) -> Iterator[tuple[str, apk.APK]]:
+        """
+        Yields a list of tuples of SHA256 hash of the APK and [APK][androguard.core.apk.APK] objects
+        of all analyzed APKs in the Session.
 
-    def get_objects_apk(self, filename):
-        digest = self.analyzed_files.get(filename)
-        if digest:
-            a = self.analyzed_apk[digest[0]][0]
+        :returns: an iterator where each element is a tuple of sha256 of the APK, and the `APK` object
+        """
+        for digest, a in self.analyzed_apk.items():
+            yield digest, a
 
-            d = None
-            dx = None
+    def get_objects_apk(
+        self,
+        filename: Union[str, None] = None,
+        digest: Union[str, None] = None,
+    ) -> Iterator[tuple[apk.APK, list[dex.DEX], Analysis]]:
+        """
+        Returns [APK][androguard.core.apk.APK], list of [DEX][androguard.core.dex.DEX], and [Analysis][androguard.core.analysis.analysis.Analysis] of a specified APK.
 
-            if len(self.analyzed_apk[digest[0]][1:]) == 1:
-                dex_file = self.analyzed_dex[self.analyzed_apk[digest[0]][1]]
-                d = dex_file[0]
-                dx = dex_file[1]
-            elif len(self.analyzed_apk[digest[0]][1:]) > 1:
-                d = []
-                dx = []
-                for dex_file in self.analyzed_apk[digest[0]][1:]:
-                    d.append(self.analyzed_dex[dex_file][0])
-                    dx.append(self.analyzed_dex[dex_file][1])
-            return a, d, dx
-        return None
+        You must specify either `filename` or `digest`.
+        It is possible to use both, but in this case only `digest` is used.
 
-    def get_objects_dex(self):
-        for digest in self.analyzed_dex:
-            yield digest, self.analyzed_dex[digest][0], self.analyzed_dex[digest][1]
+        Example:
+
+            >>> s = Session()
+            >>> digest = s.add("some.apk")
+            >>> a, d, dx = s.get_objects_apk(digest=digest)
+
+        Example:
+
+            >>> s = Session()
+            >>> filename = "some.apk"
+            >>> digest = s.add(filename)
+            >>> a, d, dx = s.get_objects_apk(filename=filename)
+
+        :param filename: the filename of the APK file, only used of digest is `None`
+        :param digest: the sha256 hash, as returned by `add` for the APK
+        :returns: a tuple of (APK, [DEX], Analysis)
+        """
+        if not filename and not digest:
+            raise ValueError("Must give at least filename or digest!")
+
+        if digest is None:
+            digests = self.analyzed_files.get(filename)
+            # Negate to reduce tree
+            if not digests:
+                return None, None, None
+            digest = digests[0]
+
+        a = self.analyzed_apk[digest][0]
+        dx = self.analyzed_vms[digest]
+        return a, dx.vms, dx
+
+    def get_objects_dex(self) -> Iterator[tuple[str, dex.DEX, Analysis]]:
+        """
+        Yields all [DEX][androguard.core.dex.DEX] objects including their [Analysis][androguard.core.analysis.analysis.Analysis] objects
+
+        :returns: tuple of (sha256, DEX, Analysis)
+        """
+        # TODO: there is no variant like get_objects_apk
+        for digest, d in self.analyzed_dex.items():
+            yield digest, d, self.analyzed_vms[digest]
