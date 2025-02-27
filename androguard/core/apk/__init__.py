@@ -1239,18 +1239,18 @@ class APK:
                 for sitem in item.findall(".//action"):
                     val = sitem.get(self._ns("name"))
                     if val == "android.intent.action.MAIN":
-                        activity = item.get(self._ns("name"))
+                        activity = item.get(self._ns("name")) or item.get("name")
                         if activity is not None:
-                            x.add(item.get(self._ns("name")))
+                            x.add(activity)
                         else:
                             logger.warning('Main activity without name')
 
                 for sitem in item.findall(".//category"):
                     val = sitem.get(self._ns("name"))
                     if val == "android.intent.category.LAUNCHER":
-                        activity = item.get(self._ns("name"))
+                        activity = item.get(self._ns("name")) or item.get("name")
                         if activity is not None:
-                            y.add(item.get(self._ns("name")))
+                            y.add(activity)
                         else:
                             logger.warning('Launcher activity without name')
 
@@ -2761,7 +2761,7 @@ class APK:
 
         :returns: List of filenames matching a Signature
         """
-        signature_expr = re.compile(r"^(META-INF/)(.*)(\.RSA|\.EC|\.DSA)$")
+        signature_expr = re.compile(r'\AMETA-INF/(?s:.)*\.(DSA|EC|RSA)\Z')
         signatures = []
 
         for i in self.get_files():
@@ -2796,7 +2796,7 @@ class APK:
 
         :returns: list of bytes
         """
-        signature_expr = re.compile(r"^(META-INF/)(.*)(\.RSA|\.EC|\.DSA)$")
+        signature_expr = re.compile(r'\AMETA-INF/(?s:.)*\.(DSA|EC|RSA)\Z')
         signature_datas = []
 
         for i in self.get_files():
